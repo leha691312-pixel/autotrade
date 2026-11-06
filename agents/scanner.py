@@ -1,9 +1,11 @@
 """
-Market Scanner Agent - quet Top N coin + chay TAT CA strategy duoc bat
-Ho tro OI + Funding cho strategy OI_Funding
+Market Scanner Agent - quet Top N coin + chay strategy duoc bat
+Toi uu: parallel fetch OHLCV / funding / OI (ThreadPoolExecutor)
 """
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time as _time
 import pandas as pd
 from loguru import logger
 from core.exchange import ExchangeWrapper
@@ -20,6 +22,8 @@ class ScannerAgent:
         enabled_strategies: Optional[List[str]] = None,
         strategy_params: Optional[Dict[str, dict]] = None,
         excluded_symbols: Optional[List[str]] = None,
+        max_workers: int = 12,
+        ohlcv_limit: int = 150,
     ):
         self.exchange = exchange
         self.top_n = top_n
@@ -33,9 +37,12 @@ class ScannerAgent:
         self.last_dfs: Dict[str, pd.DataFrame] = {}
         self.excluded_symbols: set = set()
         self.set_excluded_symbols(excluded_symbols or [])
+        self.max_workers = max(2, min(int(max_workers), 24))
+        self.ohlcv_limit = max(60, int(ohlcv_limit))
         names = [s.name for s in self.strategies]
         logger.info(
             f"ScannerAgent ready | Top {top_n} | TFs={self.timeframes} | "
+            f"workers={self.max_workers} limit={self.ohlcv_limit} | "
             f"Excluded={len(self.excluded_symbols)} | "
             f"Strategies ({len(names)}): {names}"
         )
@@ -104,7 +111,46 @@ class ScannerAgent:
         )
         logger.info(f"Strategies reloaded: {[s.name for s in self.strategies]}")
 
+    def _need_oi_funding(self) -> bool:
+        return any(s.name == "OI_Funding" for s in self.strategies)
+
+    def _fetch_ohlcv_one(self, symbol: str, tf: str) -> Tuple[str, str, Optional[pd.DataFrame]]:
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(symbol, tf, limit=self.ohlcv_limit)
+            if not ohlcv or len(ohlcv) < 50:
+                return symbol, tf, None
+            df = pd.DataFrame(
+                ohlcv,
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            return symbol, tf, df
+        except Exception as e:
+            logger.debug(f"ohlcv {symbol} {tf}: {e}")
+            return symbol, tf, None
+
+    def _fetch_meta_one(self, symbol: str) -> Tuple[str, Optional[float], Optional[float]]:
+        funding_rate = None
+        oi_value = None
+        try:
+            fr = self.exchange.fetch_funding_rate(symbol)
+            if fr and "fundingRate" in fr:
+                funding_rate = float(fr["fundingRate"])
+        except Exception:
+            pass
+        try:
+            oi = self.exchange.fetch_open_interest(symbol)
+            if oi and "openInterestAmount" in oi:
+                oi_value = float(oi["openInterestAmount"])
+            elif oi and "openInterest" in oi:
+                oi_value = float(oi["openInterest"])
+        except Exception:
+            pass
+        return symbol, funding_rate, oi_value
+
     def scan(self) -> List[Signal]:
+        t0 = _time.time()
+
         symbols = self.exchange.get_top_symbols(self.top_n)
         if self.excluded_symbols:
             before = len(symbols)
@@ -112,75 +158,87 @@ class ScannerAgent:
             skipped = before - len(symbols)
             if skipped:
                 logger.info(f"Excluded {skipped} symbol(s) from scan blacklist")
+
         logger.info(
             f"Scanning {len(symbols)} symbols | strategies={[s.name for s in self.strategies]} "
-            f"| blacklist={len(self.excluded_list_display())}"
+            f"| TFs={self.timeframes} workers={self.max_workers} blacklist={len(self.excluded_list_display())}"
         )
 
         all_signals: List[Signal] = []
         per_strat: Counter = Counter()
         self.last_dfs = {}
 
-        for symbol in symbols:
-            funding_rate = None
-            oi_value = None
-            try:
-                fr = self.exchange.fetch_funding_rate(symbol)
-                if fr and "fundingRate" in fr:
-                    funding_rate = float(fr["fundingRate"])
-                oi = self.exchange.fetch_open_interest(symbol)
-                if oi and "openInterestAmount" in oi:
-                    oi_value = float(oi["openInterestAmount"])
-                elif oi and "openInterest" in oi:
-                    oi_value = float(oi["openInterest"])
-            except Exception:
-                pass
-
-            for tf in self.timeframes:
+        # parallel OHLCV
+        jobs = [(sym, tf) for sym in symbols for tf in self.timeframes]
+        ohlcv_map: Dict[Tuple[str, str], pd.DataFrame] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            futs = [pool.submit(self._fetch_ohlcv_one, sym, tf) for sym, tf in jobs]
+            for fut in as_completed(futs):
                 try:
-                    ohlcv = self.exchange.fetch_ohlcv(symbol, tf, limit=200)
-                    if not ohlcv or len(ohlcv) < 50:
-                        continue
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"],
-                    )
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-                    self.last_dfs[symbol] = df
-                    self.last_dfs[f"{symbol}_{tf}"] = df
-
-                    for strat in self.strategies:
-                        try:
-                            if strat.name == "OI_Funding":
-                                oi_series = None
-                                if oi_value is not None:
-                                    oi_series = pd.Series(
-                                        [oi_value * 0.97] * (len(df) - 1) + [oi_value]
-                                    )
-                                signals = strat.generate(
-                                    df, symbol, tf,
-                                    oi_series=oi_series,
-                                    funding_rate=funding_rate,
-                                )
-                            else:
-                                signals = strat.generate(df, symbol, tf)
-
-                            if signals:
-                                all_signals.extend(signals)
-                                per_strat[strat.name] += len(signals)
-                        except Exception as e:
-                            logger.debug(f"Strategy {strat.name} error {symbol} {tf}: {e}")
+                    sym, tf, df = fut.result()
+                    if df is not None:
+                        ohlcv_map[(sym, tf)] = df
+                        self.last_dfs[sym] = df
+                        self.last_dfs[f"{sym}_{tf}"] = df
                 except Exception as e:
-                    logger.warning(f"Scan error {symbol} {tf}: {e}")
-                    continue
+                    logger.debug(f"ohlcv worker: {e}")
 
-        all_signals.sort(key=lambda s: s.confidence, reverse=True)
+        t_ohlcv = _time.time()
+
+        # funding/OI only if OI_Funding enabled
+        meta: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+        if self._need_oi_funding() and symbols:
+            with ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as pool:
+                futs = [pool.submit(self._fetch_meta_one, sym) for sym in symbols]
+                for fut in as_completed(futs):
+                    try:
+                        sym, fr, oi = fut.result()
+                        meta[sym] = (fr, oi)
+                    except Exception:
+                        pass
+        t_meta = _time.time()
+
+        for symbol in symbols:
+            funding_rate, oi_value = meta.get(symbol, (None, None))
+            for tf in self.timeframes:
+                df = ohlcv_map.get((symbol, tf))
+                if df is None or len(df) < 50:
+                    continue
+                for strat in self.strategies:
+                    try:
+                        if strat.name == "OI_Funding":
+                            oi_series = None
+                            if oi_value is not None:
+                                oi_series = pd.Series(
+                                    [oi_value * 0.97] * (len(df) - 1) + [oi_value]
+                                )
+                            signals = strat.generate(
+                                df, symbol, tf,
+                                oi_series=oi_series,
+                                funding_rate=funding_rate,
+                            )
+                        else:
+                            signals = strat.generate(df, symbol, tf)
+                        if signals:
+                            if not isinstance(signals, list):
+                                signals = [signals]
+                            signals = [x for x in signals if x is not None]
+                            all_signals.extend(signals)
+                            per_strat[strat.name] += len(signals)
+                    except Exception as e:
+                        logger.debug(f"Strategy {strat.name} error {symbol} {tf}: {e}")
+
+        all_signals.sort(key=lambda sig: getattr(sig, "confidence", 0) or 0, reverse=True)
+        elapsed = _time.time() - t0
 
         if per_strat:
             detail = ", ".join(f"{k}={v}" for k, v in sorted(per_strat.items(), key=lambda x: -x[1]))
-            logger.info(f"Found {len(all_signals)} raw signals | by strategy: {detail}")
+            logger.info(
+                f"Found {len(all_signals)} raw signals | by strategy: {detail} | "
+                f"scan={elapsed:.1f}s (ohlcv={t_ohlcv-t0:.1f}s meta={t_meta-t_ohlcv:.1f}s strat={elapsed-(t_meta-t0):.1f}s)"
+            )
         else:
-            logger.info("Found 0 raw signals")
+            logger.info(f"Found 0 raw signals | scan={elapsed:.1f}s")
 
         return all_signals
 
