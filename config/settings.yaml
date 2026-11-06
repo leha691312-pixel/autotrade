@@ -1,0 +1,38 @@
+mode: testnet
+exchange: binanceusdm
+
+top_n: 50
+scan_interval_seconds: 120
+
+excluded_symbols: []
+timeframes: ["15m", "1h", "4h"]
+
+enabled_strategies:
+  - ORB
+  - LiquiditySweep
+  - MARibbon
+  - StochBB
+  - PivotScalp
+  - EMARSIScalp
+  - OrderBlock
+  - SupplyDemand
+  - FVG
+  - BOS_CHOCH
+  - TrendMA
+  - MomentumRSI
+  - PullbackEMA
+  - RangeBounce
+  - OI_Funding
+  - SwingMACross
+  - SwingRSI
+  - FibPullback
+  - BBSqueeze
+
+strategy_params:
+  ORB: {range_bars: 4, rr: 2.0}
+  LiquiditySweep: {lookback: 30, rr: 2.0}
+  MARibbon: {sma1: 5, sma2: 8, sma3: 13, rr: 1.8}
+  StochBB: {k_period: 5, d_period: 3, bb_period: 13, bb_std: 3.0, rr: 1.6}
+  PivotScalp: {left: 2, right: 2, rr: 1.6}
+  EMARSIScalp: {ema_fast: 8, ema_slow: 21, rsi_period: 7, rr: 1.5}
+  OrderBlock: {impulse_mult: 2.2, rr: 2.5}
