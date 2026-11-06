@@ -1,6 +1,6 @@
 """
 Execution Agent - entry market + TP/SL algo protective
-- TP: TAKE_PROFIT_MARKET (algo) — tranh LIMIT khop ngay
+- TP: TAKE_PROFIT_MARKET (algo) quantity only — KHONG closePosition
 - SL: STOP_MARKET closePosition + MARK_PRICE
 - Neo SL/TP theo gia fill + last price
 """
@@ -168,7 +168,6 @@ class ExecutionAgent:
 
     def _round_amount(self, symbol: str, amount: float) -> float:
         try:
-            # Prefer exchange.round_qty if available
             if hasattr(self.exchange, "round_qty"):
                 q = self.exchange.round_qty(symbol, amount)
                 if q > 0:
@@ -240,12 +239,17 @@ class ExecutionAgent:
             f"Protective prices {signal.symbol} {side} fill={entry:.6f} last={ref:.6f} "
             f"SL={sl:.6f} TP={tp:.6f}"
         )
+        try:
+            signal.sl = float(sl)
+            signal.tp = float(tp)
+        except Exception:
+            pass
         return sl, tp, True
 
     def _place_protective_orders(
         self, signal, size: float, fill_price: float = None
     ):
-        """TP = TAKE_PROFIT_MARKET; SL = STOP_MARKET closePosition."""
+        """SL = STOP_MARKET closePosition; TP = TAKE_PROFIT_MARKET quantity only."""
         if self.exchange.mode.value == "paper":
             logger.info(
                 f"[PAPER] Protective | SL={signal.sl:.6f} TP={signal.tp:.6f}"
@@ -266,7 +270,7 @@ class ExecutionAgent:
         sl_ok, tp_ok = False, False
         sl_id, tp_id = "", ""
 
-        # SL first
+        # SL: closePosition OK (one per symbol)
         try:
             sl_order = self.exchange.create_order(
                 symbol=signal.symbol,
@@ -294,6 +298,7 @@ class ExecutionAgent:
                     params={
                         "stopPrice": sl_px,
                         "reduceOnly": True,
+                        "closePosition": False,
                         "workingType": "MARK_PRICE",
                     },
                 )
@@ -303,7 +308,7 @@ class ExecutionAgent:
             except Exception as e2:
                 logger.error(f"SL STOP_MARKET final failed: {e2}")
 
-        # TP algo — tranh LIMIT marketable
+        # TP: NEVER closePosition (Binance conflict with SL closePosition)
         try:
             tp_order = self.exchange.create_order(
                 symbol=signal.symbol,
@@ -313,6 +318,7 @@ class ExecutionAgent:
                 params={
                     "stopPrice": tp_px,
                     "reduceOnly": True,
+                    "closePosition": False,
                     "workingType": "MARK_PRICE",
                 },
             )
