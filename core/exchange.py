@@ -2,6 +2,7 @@
 Exchange wrapper: paper / testnet / live
 Testnet+Live: REST truc tiep + ccxt (tranh margin/sapi loi tren testnet)
 SL/TP: uu tien Algo Order API (STOP_MARKET / TAKE_PROFIT_MARKET)
+Market/LIMIT: REST /fapi/v1/order truoc, fallback ccxt
 """
 import os, time, uuid, hmac, hashlib, math, urllib.parse
 from typing import Dict, List, Optional, Any
@@ -407,24 +408,63 @@ class ExchangeWrapper:
 
     def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                      order_type: str = "market", params: dict = None) -> dict:
+        """Market/LIMIT via REST /fapi/v1/order; SL/TP via algoOrder. Avoids ccxt KeyError on testnet."""
         params = params or {}
-        amount = self.round_qty(symbol, amount)
-        if amount <= 0:
-            raise ValueError(f"Invalid amount after rounding for {symbol}")
-        if price is not None:
-            price = self.round_price(symbol, price)
         if self.mode == Mode.PAPER:
             return self._paper_create_order(symbol, side, amount, price, order_type, params)
         ot = (order_type or "market").upper()
         if ot in ("STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP", "TAKE_PROFIT"):
             return self._create_algo_order(symbol, side, amount, price, ot, params)
+
+        raw = self._raw_sym(symbol)
+        qty = self.round_qty(symbol, amount)
+        if qty <= 0:
+            raise RuntimeError(f"Quantity rounded to 0 for {raw}")
+
+        body: Dict[str, Any] = {
+            "symbol": raw,
+            "side": side.upper(),
+            "type": ot,
+            "quantity": qty,
+        }
+        if ot == "LIMIT":
+            if price is None:
+                raise RuntimeError("LIMIT order requires price")
+            body["price"] = self.round_price(symbol, float(price))
+            body["timeInForce"] = params.get("timeInForce", "GTC")
+        if params.get("reduceOnly"):
+            body["reduceOnly"] = "true"
+
         try:
-            if self.exchange:
-                return self.exchange.create_order(symbol=symbol, type=order_type, side=side, amount=amount, price=price, params=params)
-            raise Exception("no exchange")
+            data = self._signed_request("POST", "/fapi/v1/order", body)
+            avg = float(data.get("avgPrice") or data.get("price") or 0)
+            logger.info(f"[{self.mode.value}] Order {ot} {side} {qty} {raw} id={data.get('orderId')}")
+            return {
+                "id": str(data.get("orderId") or ""),
+                "symbol": symbol,
+                "side": side,
+                "amount": qty,
+                "price": body.get("price") or avg,
+                "average": avg,
+                "status": data.get("status"),
+                "info": data,
+            }
         except Exception as e:
-            logger.error(f"Order failed: {e}")
-            raise
+            logger.error(f"Order failed REST: {e} → try ccxt")
+            try:
+                order = self.exchange.create_order(
+                    symbol=symbol,
+                    type=order_type.lower(),
+                    side=side.lower(),
+                    amount=qty,
+                    price=price,
+                    params=params,
+                )
+                logger.info(f"[{self.mode.value}] Order via ccxt: {symbol} {side} {qty}")
+                return order
+            except Exception as e2:
+                logger.error(f"Order failed: {e2}")
+                raise
 
     def _create_algo_order(self, symbol: str, side: str, amount: float, price, order_type: str, params: dict) -> dict:
         stop_price = params.get("stopPrice") or price
