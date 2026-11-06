@@ -1,7 +1,7 @@
 """
 Exchange wrapper: paper / testnet / live
 Testnet+Live: REST truc tiep + ccxt (tranh margin/sapi loi tren testnet)
-SL/TP: uu tien Algo Order API (STOP_MARKET / TAKE_PROFIT_MARKET)
+SL/TP: Algo Order API (STOP_MARKET / TAKE_PROFIT_MARKET), closePosition + MARK_PRICE
 Market/LIMIT: REST /fapi/v1/order truoc, fallback ccxt
 """
 import os, time, uuid, hmac, hashlib, math, urllib.parse
@@ -408,7 +408,6 @@ class ExchangeWrapper:
 
     def create_order(self, symbol: str, side: str, amount: float, price: Optional[float] = None,
                      order_type: str = "market", params: dict = None) -> dict:
-        """Market/LIMIT via REST /fapi/v1/order; SL/TP via algoOrder. Avoids ccxt KeyError on testnet."""
         params = params or {}
         if self.mode == Mode.PAPER:
             return self._paper_create_order(symbol, side, amount, price, order_type, params)
@@ -453,12 +452,8 @@ class ExchangeWrapper:
             logger.error(f"Order failed REST: {e} → try ccxt")
             try:
                 order = self.exchange.create_order(
-                    symbol=symbol,
-                    type=order_type.lower(),
-                    side=side.lower(),
-                    amount=qty,
-                    price=price,
-                    params=params,
+                    symbol=symbol, type=order_type.lower(), side=side.lower(),
+                    amount=qty, price=price, params=params,
                 )
                 logger.info(f"[{self.mode.value}] Order via ccxt: {symbol} {side} {qty}")
                 return order
@@ -473,22 +468,42 @@ class ExchangeWrapper:
         stop_price = self.round_price(symbol, float(stop_price))
         amount = self.round_qty(symbol, amount)
         mid = self._market_id(symbol)
-        algo_type = "STOP_MARKET" if "STOP" in order_type.upper() else "TAKE_PROFIT_MARKET"
-        body = {
+        ot_up = (order_type or "").upper()
+        algo_type = "TAKE_PROFIT_MARKET" if "TAKE_PROFIT" in ot_up else "STOP_MARKET"
+        working = params.get("workingType") or "MARK_PRICE"
+        client_id = f"bot{uuid.uuid4().hex[:16]}"
+
+        def _post(body):
+            data = self._signed_request("POST", "/fapi/v1/algoOrder", body)
+            oid = data.get("algoId") or data.get("clientAlgoId") or data.get("orderId")
+            logger.info(f"Algo {body.get('type')} {symbol} {side} trigger={stop_price} id={oid}")
+            return {
+                "id": str(oid or ""), "symbol": symbol, "side": side, "amount": amount,
+                "price": stop_price, "stopPrice": stop_price, "type": body.get("type"),
+                "status": data.get("algoStatus") or data.get("status") or "open", "info": data,
+            }
+
+        # Prefer closePosition (no qty mismatch)
+        if params.get("closePosition", True) and algo_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            body_cp = {
+                "algoType": "CONDITIONAL", "symbol": mid, "side": side.upper(),
+                "type": algo_type, "triggerPrice": stop_price,
+                "closePosition": "true", "workingType": working, "clientAlgoId": client_id,
+            }
+            try:
+                return _post(body_cp)
+            except Exception as e:
+                logger.warning(f"Algo closePosition failed: {e} → quantity")
+
+        if amount <= 0:
+            raise ValueError(f"Algo order qty=0 for {mid}")
+        body_qty = {
             "algoType": "CONDITIONAL", "symbol": mid, "side": side.upper(),
             "type": algo_type, "triggerPrice": stop_price, "quantity": amount,
             "reduceOnly": "true" if params.get("reduceOnly", True) else "false",
-            "workingType": params.get("workingType") or "CONTRACT_PRICE",
-            "clientAlgoId": f"bot{uuid.uuid4().hex[:16]}",
+            "workingType": working, "clientAlgoId": f"bot{uuid.uuid4().hex[:16]}",
         }
-        if params.get("closePosition"):
-            body["closePosition"] = "true"
-            body.pop("quantity", None)
-        data = self._signed_request("POST", "/fapi/v1/algoOrder", body)
-        logger.info(f"Algo {algo_type} {symbol} {side} qty={amount} trigger={stop_price}")
-        return {"id": str(data.get("algoId") or data.get("clientAlgoId") or ""), "symbol": symbol,
-                "side": side, "amount": amount, "price": stop_price, "stopPrice": stop_price,
-                "type": algo_type, "status": "open", "info": data}
+        return _post(body_qty)
 
     def _paper_create_order(self, symbol, side, amount, price, order_type, params):
         order_id = str(uuid.uuid4())[:12]
