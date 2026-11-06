@@ -68,13 +68,59 @@ def main():
     setup_logger(settings.get("log_file", "logs/bot.log"), settings.get("log_level", "INFO"))
 
     mode = settings.get("mode", "paper")
-    logger.info(f"Starting bot mode={mode}")
+    logger.info(f"=== Starting Bot in mode: {mode.upper()} ===")
+
+    if mode == "live":
+        logger.warning("LIVE MODE – Real money at risk.")
+        confirm = input("Type 'YES I UNDERSTAND' to continue: ")
+        if confirm != "YES I UNDERSTAND":
+            logger.info("Aborted.")
+            return
 
     exchange = ExchangeWrapper(mode=mode, config=settings)
-    risk_gate = RiskGate(risk_cfg)
-    order_logger = OrderLogger()
+    risk_gate = RiskGate(risk_config=risk_cfg, equity=exchange.get_balance())
+    order_logger = OrderLogger(path="data/orders.xlsx")
 
-    ml_agent = MLAgent(settings.get("ml") or {})
+    synced = risk_gate.sync_positions_from_exchange(exchange)
+    logger.info(f"Startup sync: {synced} positions")
+
+    try:
+        n = exchange.cleanup_orphan_orders()
+        if n:
+            logger.info(f"Startup cleaned orphan orders ≈{n}")
+    except Exception as e:
+        logger.warning(f"Startup cleanup_orphan_orders: {e}")
+
+    enabled = settings.get("enabled_strategies")
+    if enabled is not None and len(enabled) == 0:
+        enabled = None
+
+    scanner = ScannerAgent(
+        exchange,
+        top_n=settings.get("top_n", 30),
+        timeframes=settings.get("timeframes", ["15m", "1h"]),
+        enabled_strategies=enabled,
+        strategy_params=settings.get("strategy_params") or {},
+        excluded_symbols=settings.get("excluded_symbols") or [],
+        max_workers=int(settings.get("scan_workers", 16)),
+        ohlcv_limit=int(settings.get("ohlcv_limit", 120)),
+    )
+    logger.info(f"Active strategies: {[s.name for s in scanner.strategies]}")
+
+    ml_agent = MLAgent(
+        model_path=settings.get("ml_model_path", "data/models/signal_filter.joblib"),
+        samples_path=settings.get("ml_samples_path", "data/models/train_samples.jsonl"),
+        min_samples=int(settings.get("ml_min_samples", 80)),
+        retrain_every_new=int(settings.get("ml_retrain_every_new", 25)),
+        min_retrain_hours=float(settings.get("ml_retrain_hours", 12)),
+        collect_only=bool(settings.get("ml_collect_only", True)),
+        filter_enabled=bool(settings.get("ml_filter_enabled", True)),
+        min_auc_deploy=float(settings.get("ml_min_auc_deploy", 0.55)),
+        min_class_count=int(settings.get("ml_min_class_count", 20)),
+        fee_rate=float(settings.get("ml_fee_rate", 0.0004)),
+        min_r_multiple=float(settings.get("ml_min_r_multiple", 0.25)),
+        prob_threshold=float(settings.get("ml_prob_threshold", 0.55)),
+    )
     _attach_ml_close_hook(risk_gate, ml_agent)
 
     ohlcv_cache = {}
@@ -88,23 +134,10 @@ def main():
         ohlcv_cache=ohlcv_cache,
     )
 
-    enabled = settings.get("enabled_strategies") or list_strategy_names()
-    scanner = ScannerAgent(
-        exchange,
-        enabled_strategies=enabled,
-        top_n=int(settings.get("top_n", 30)),
-        timeframes=settings.get("timeframes") or ["15m", "1h"],
-        strategy_params=settings.get("strategy_params") or {},
-        max_workers=int(settings.get("scan_workers", 16)),
-        ohlcv_limit=int(settings.get("ohlcv_limit", 120)),
-    )
-
     try:
         start_discord_in_thread()
     except Exception as e:
         logger.debug(f"Discord control skip: {e}")
-
-    risk_gate.update_equity(exchange.get_balance())
 
     try:
         while True:
@@ -155,15 +188,16 @@ def main():
             if hasattr(scanner, "timeframes") and settings.get("timeframes"):
                 scanner.timeframes = list(settings.get("timeframes"))
 
-            if control_state.reload_strategies:
+            if getattr(control_state, "reload_strategies", False):
                 control_state.reload_strategies = False
-                enabled = settings.get("enabled_strategies") or list_strategy_names()
+                new_enabled = settings.get("enabled_strategies")
                 scanner = ScannerAgent(
                     exchange,
-                    enabled_strategies=enabled,
-                    top_n=int(settings.get("top_n", 30)),
-                    timeframes=settings.get("timeframes") or ["15m", "1h"],
+                    top_n=settings.get("top_n", 30),
+                    timeframes=settings.get("timeframes", ["15m", "1h"]),
+                    enabled_strategies=new_enabled if new_enabled else None,
                     strategy_params=settings.get("strategy_params") or {},
+                    excluded_symbols=settings.get("excluded_symbols") or [],
                     max_workers=int(settings.get("scan_workers", 16)),
                     ohlcv_limit=int(settings.get("ohlcv_limit", 120)),
                 )
@@ -176,7 +210,7 @@ def main():
             signals = ml_agent.filter(raw_signals, dfs=ohlcv_cache if ohlcv_cache else None)
 
             executed = 0
-            # Chi 1 lenh moi / cycle de tranh dong loat bi testnet dong som
+            # Chi 1 lenh moi / cycle
             for sig in signals[:1]:
                 if executor.execute(sig):
                     executed += 1
