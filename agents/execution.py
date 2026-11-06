@@ -1,9 +1,8 @@
 """
-Execution Agent - entry market + TP LIMIT + SL STOP_MARKET
-- Isolated margin + leverage hop ly
-- ML on_open kem risk_amount / notional de label R-multiple
-- TP: LIMIT reduceOnly (Open Orders)
-- SL: STOP_MARKET only (LIMIT SL khop ngay = bug)
+Execution Agent - entry market + TP/SL algo protective
+- TP: TAKE_PROFIT_MARKET (algo) — tranh LIMIT khop ngay
+- SL: STOP_MARKET closePosition + MARK_PRICE
+- Neo SL/TP theo gia fill + last price
 """
 from typing import Optional, Set, Tuple
 from loguru import logger
@@ -125,7 +124,7 @@ class ExecutionAgent:
             logger.info(
                 f"EXECUTED {signal.side.value} {signal.symbol} size={size:.6f} lev={leverage}x "
                 f"entry≈{fill_price:.6f} SL={signal.sl:.6f} TP={signal.tp:.6f} "
-                f"strategy={signal.strategy} | margin=ISOLATED | TP=LIMIT SL=STOP_MARKET"
+                f"strategy={signal.strategy} | TP=TP_MARKET SL=STOP_MARKET"
             )
 
             if self.order_logger:
@@ -142,7 +141,7 @@ class ExecutionAgent:
                         strategy=signal.strategy,
                         order_id=order_id,
                         status="FILLED",
-                        note=f"lev={leverage}x SL_ok={sl_ok} TP_ok={tp_ok} TP=LIMIT SL=STOP_MARKET",
+                        note=f"lev={leverage}x SL_ok={sl_ok} TP_ok={tp_ok}",
                     )
                 except Exception as e:
                     logger.debug(f"order_logger: {e}")
@@ -169,6 +168,11 @@ class ExecutionAgent:
 
     def _round_amount(self, symbol: str, amount: float) -> float:
         try:
+            # Prefer exchange.round_qty if available
+            if hasattr(self.exchange, "round_qty"):
+                q = self.exchange.round_qty(symbol, amount)
+                if q > 0:
+                    return q
             markets = getattr(self.exchange.exchange, "markets", None) or {}
             m = markets.get(symbol) or {}
             prec = (m.get("precision") or {}).get("amount")
@@ -183,6 +187,7 @@ class ExecutionAgent:
         return round(amount, 6)
 
     def _normalize_sl_tp(self, signal, fill_price: float):
+        """Neo SL/TP theo gia fill + last; dung phia, min distance."""
         entry = float(fill_price or signal.entry or 0)
         sl = float(signal.sl)
         tp = float(signal.tp)
@@ -191,34 +196,59 @@ class ExecutionAgent:
         if entry <= 0:
             return sl, tp, True
 
-        if side == "LONG":
-            if sl >= entry:
-                logger.error(f"Invalid SL for LONG: SL={sl} >= entry={entry}")
-                return sl, tp, False
-            if tp <= entry:
-                logger.warning(f"TP for LONG below entry — check signal TP={tp} entry={entry}")
-        else:
-            if sl <= entry:
-                logger.error(f"Invalid SL for SHORT: SL={sl} <= entry={entry}")
-                return sl, tp, False
-            if tp >= entry:
-                logger.warning(f"TP for SHORT above entry — check signal TP={tp} entry={entry}")
+        try:
+            t = self.exchange.fetch_ticker(signal.symbol)
+            last = float(t.get("last") or entry)
+        except Exception:
+            last = entry
+        ref = last if last > 0 else entry
+        min_dist = 0.002  # 0.2%
 
-        stop_pct = abs(entry - sl) / entry * 100
+        if side == "LONG":
+            if sl >= ref:
+                sl = ref * (1 - min_dist)
+            if tp <= ref:
+                tp = ref * (1 + min_dist)
+            if sl >= entry:
+                sl = entry * (1 - min_dist)
+            if tp <= entry:
+                tp = entry * (1 + min_dist)
+        else:
+            if sl <= ref:
+                sl = ref * (1 + min_dist)
+            if tp >= ref:
+                tp = ref * (1 - min_dist)
+            if sl <= entry:
+                sl = entry * (1 + min_dist)
+            if tp >= entry:
+                tp = entry * (1 - min_dist)
+
+        stop_pct = abs(entry - sl) / entry * 100 if entry else 0
         if stop_pct < 0.15:
             logger.error(
                 f"SL too tight ({stop_pct:.3f}% < 0.15%) {signal.symbol} — skip protective"
             )
             return sl, tp, False
+
+        try:
+            sl = self.exchange.round_price(signal.symbol, sl)
+            tp = self.exchange.round_price(signal.symbol, tp)
+        except Exception:
+            pass
+
+        logger.info(
+            f"Protective prices {signal.symbol} {side} fill={entry:.6f} last={ref:.6f} "
+            f"SL={sl:.6f} TP={tp:.6f}"
+        )
         return sl, tp, True
 
     def _place_protective_orders(
         self, signal, size: float, fill_price: float = None
     ):
+        """TP = TAKE_PROFIT_MARKET; SL = STOP_MARKET closePosition."""
         if self.exchange.mode.value == "paper":
             logger.info(
-                f"[PAPER] Protective | SL={signal.sl:.6f} TP={signal.tp:.6f} "
-                f"(TP=LIMIT SL=STOP_MARKET)"
+                f"[PAPER] Protective | SL={signal.sl:.6f} TP={signal.tp:.6f}"
             )
             key = f"{signal.symbol}_{signal.side.value}"
             if key in self.exchange.paper_positions:
@@ -236,35 +266,7 @@ class ExecutionAgent:
         sl_ok, tp_ok = False, False
         sl_id, tp_id = "", ""
 
-        try:
-            tp_order = self.exchange.create_order(
-                symbol=signal.symbol,
-                side=close_side,
-                amount=size,
-                price=tp_px,
-                order_type="limit",
-                params={"reduceOnly": True, "timeInForce": "GTC"},
-            )
-            tp_id = str(tp_order.get("id", ""))
-            tp_ok = True
-            logger.info(f"TP LIMIT placed {signal.symbol} @ {tp_px}")
-        except Exception as e:
-            logger.error(f"TP LIMIT FAILED {signal.symbol}: {e}")
-            try:
-                tp_order = self.exchange.create_order(
-                    symbol=signal.symbol,
-                    side=close_side,
-                    amount=size,
-                    price=tp_px,
-                    order_type="limit",
-                    params={"reduceOnly": True},
-                )
-                tp_id = str(tp_order.get("id", ""))
-                tp_ok = True
-                logger.info(f"TP LIMIT retry OK {signal.symbol} @ {tp_px}")
-            except Exception as e2:
-                logger.error(f"TP LIMIT retry failed: {e2}")
-
+        # SL first
         try:
             sl_order = self.exchange.create_order(
                 symbol=signal.symbol,
@@ -274,26 +276,78 @@ class ExecutionAgent:
                 params={
                     "stopPrice": sl_px,
                     "reduceOnly": True,
-                    "workingType": "CONTRACT_PRICE",
+                    "closePosition": True,
+                    "workingType": "MARK_PRICE",
                 },
             )
             sl_id = str(sl_order.get("id", ""))
             sl_ok = True
             logger.info(f"SL STOP_MARKET placed {signal.symbol} @ {sl_px}")
         except Exception as e:
-            logger.warning(f"SL STOP_MARKET failed {signal.symbol}: {e} → retry")
+            logger.warning(f"SL closePosition failed {signal.symbol}: {e} → qty")
             try:
                 sl_order = self.exchange.create_order(
                     symbol=signal.symbol,
                     side=close_side,
                     amount=size,
                     order_type="STOP_MARKET",
-                    params={"stopPrice": sl_px, "reduceOnly": True},
+                    params={
+                        "stopPrice": sl_px,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE",
+                    },
                 )
                 sl_id = str(sl_order.get("id", ""))
                 sl_ok = True
                 logger.info(f"SL STOP_MARKET retry OK {signal.symbol} @ {sl_px}")
             except Exception as e2:
                 logger.error(f"SL STOP_MARKET final failed: {e2}")
+
+        # TP algo — tranh LIMIT marketable
+        try:
+            tp_order = self.exchange.create_order(
+                symbol=signal.symbol,
+                side=close_side,
+                amount=size,
+                order_type="TAKE_PROFIT_MARKET",
+                params={
+                    "stopPrice": tp_px,
+                    "reduceOnly": True,
+                    "workingType": "MARK_PRICE",
+                },
+            )
+            tp_id = str(tp_order.get("id", ""))
+            tp_ok = True
+            logger.info(f"TP TAKE_PROFIT_MARKET placed {signal.symbol} @ {tp_px}")
+        except Exception as e:
+            logger.error(f"TP TP_MARKET FAILED {signal.symbol}: {e} → LIMIT check")
+            try:
+                try:
+                    t = self.exchange.fetch_ticker(signal.symbol)
+                    last = float(t.get("last") or fill)
+                except Exception:
+                    last = fill
+                marketable = (
+                    (signal.side.value == "LONG" and tp_px <= last)
+                    or (signal.side.value == "SHORT" and tp_px >= last)
+                )
+                if marketable:
+                    logger.error(
+                        f"TP LIMIT would fill immediately @ {tp_px} last={last} — skip"
+                    )
+                else:
+                    tp_order = self.exchange.create_order(
+                        symbol=signal.symbol,
+                        side=close_side,
+                        amount=size,
+                        price=tp_px,
+                        order_type="limit",
+                        params={"reduceOnly": True, "timeInForce": "GTC"},
+                    )
+                    tp_id = str(tp_order.get("id", ""))
+                    tp_ok = True
+                    logger.info(f"TP LIMIT fallback OK {signal.symbol} @ {tp_px}")
+            except Exception as e2:
+                logger.error(f"TP fallback failed: {e2}")
 
         return sl_ok, tp_ok, sl_id, tp_id
