@@ -97,11 +97,13 @@ def main():
 
     scanner = ScannerAgent(
         exchange,
-        top_n=settings.get("top_n", 20),
+        top_n=settings.get("top_n", 30),
         timeframes=settings.get("timeframes", ["15m", "1h"]),
         enabled_strategies=enabled,
         strategy_params=settings.get("strategy_params") or {},
         excluded_symbols=settings.get("excluded_symbols") or [],
+        max_workers=int(settings.get("scan_workers", 16)),
+        ohlcv_limit=int(settings.get("ohlcv_limit", 120)),
     )
     logger.info(f"Active strategies: {[s.name for s in scanner.strategies]}")
 
@@ -188,6 +190,12 @@ def main():
 
             if hasattr(scanner, "top_n"):
                 scanner.top_n = int(settings.get("top_n", scanner.top_n))
+            if hasattr(scanner, "max_workers") and settings.get("scan_workers") is not None:
+                scanner.max_workers = max(2, min(int(settings.get("scan_workers", 16)), 24))
+            if hasattr(scanner, "ohlcv_limit") and settings.get("ohlcv_limit") is not None:
+                scanner.ohlcv_limit = max(60, int(settings.get("ohlcv_limit", 120)))
+            if hasattr(scanner, "timeframes") and settings.get("timeframes"):
+                scanner.timeframes = list(settings.get("timeframes"))
             if hasattr(scanner, "set_excluded_symbols"):
                 scanner.set_excluded_symbols(settings.get("excluded_symbols") or [])
             new_enabled = settings.get("enabled_strategies")
