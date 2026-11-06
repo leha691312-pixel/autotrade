@@ -1,11 +1,13 @@
 mode: testnet
 exchange: binanceusdm
 
-top_n: 50
-scan_interval_seconds: 120
+top_n: 30
+scan_interval_seconds: 60
+scan_workers: 16
+ohlcv_limit: 120
 
 excluded_symbols: []
-timeframes: ["15m", "1h", "4h"]
+timeframes: ["15m", "1h"]
 
 enabled_strategies:
   - ORB
