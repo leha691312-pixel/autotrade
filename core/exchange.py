@@ -1,7 +1,7 @@
 """
 Exchange wrapper: paper / testnet / live
 Testnet+Live: REST truc tiep + ccxt (tranh margin/sapi loi tren testnet)
-SL/TP: Algo Order API (STOP_MARKET / TAKE_PROFIT_MARKET), closePosition + MARK_PRICE
+SL/TP: Algo Order API — closePosition chi khi params closePosition=True (thuong chi SL)
 Market/LIMIT: REST /fapi/v1/order truoc, fallback ccxt
 """
 import os, time, uuid, hmac, hashlib, math, urllib.parse
@@ -421,10 +421,7 @@ class ExchangeWrapper:
             raise RuntimeError(f"Quantity rounded to 0 for {raw}")
 
         body: Dict[str, Any] = {
-            "symbol": raw,
-            "side": side.upper(),
-            "type": ot,
-            "quantity": qty,
+            "symbol": raw, "side": side.upper(), "type": ot, "quantity": qty,
         }
         if ot == "LIMIT":
             if price is None:
@@ -439,14 +436,9 @@ class ExchangeWrapper:
             avg = float(data.get("avgPrice") or data.get("price") or 0)
             logger.info(f"[{self.mode.value}] Order {ot} {side} {qty} {raw} id={data.get('orderId')}")
             return {
-                "id": str(data.get("orderId") or ""),
-                "symbol": symbol,
-                "side": side,
-                "amount": qty,
-                "price": body.get("price") or avg,
-                "average": avg,
-                "status": data.get("status"),
-                "info": data,
+                "id": str(data.get("orderId") or ""), "symbol": symbol, "side": side,
+                "amount": qty, "price": body.get("price") or avg, "average": avg,
+                "status": data.get("status"), "info": data,
             }
         except Exception as e:
             logger.error(f"Order failed REST: {e} → try ccxt")
@@ -483,8 +475,8 @@ class ExchangeWrapper:
                 "status": data.get("algoStatus") or data.get("status") or "open", "info": data,
             }
 
-        # Prefer closePosition (no qty mismatch)
-        if params.get("closePosition", True) and algo_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
+        # closePosition CHI khi caller set True (SL). TP phai dung quantity.
+        if params.get("closePosition") is True and algo_type in ("STOP_MARKET", "TAKE_PROFIT_MARKET"):
             body_cp = {
                 "algoType": "CONDITIONAL", "symbol": mid, "side": side.upper(),
                 "type": algo_type, "triggerPrice": stop_price,
