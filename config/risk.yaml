@@ -1,7 +1,47 @@
+max_position_pct: 0.05
+max_total_exposure_pct: 0.30
+max_open_positions: 10
+min_risk_reward: 1.5
+max_daily_loss_pct: 0.03
+max_drawdown_pct: 0.12
+cooldown_seconds: 45
+
 default_leverage: 5
 max_leverage: 10
-risk_per_trade_pct: 0.5
-max_open_positions: 3
-max_daily_loss_pct: 3
-max_consecutive_losses: 5
+
+risk_per_trade_pct: 0.01
+atr_multiplier_sl: 1.5
+
+kill_on_consecutive_losses: 6
+max_consecutive_losses: 6
+kill_on_api_error_rate: 0.15
+
+duplicate_window_seconds: 300
+symbol_cooldown_seconds: 120
 min_rr: 1.5
+
+max_hold_minutes: 720
+max_hold_scalp_minutes: 90
+max_hold_day_minutes: 720
+max_hold_swing_minutes: 4320
+
+strategy_trade_style:
+  ORB: scalp
+  LiquiditySweep: scalp
+  MARibbon: scalp
+  StochBB: scalp
+  PivotScalp: scalp
+  EMARSIScalp: scalp
+  OrderBlock: day
+  SupplyDemand: day
+  FVG: day
+  BOS_CHOCH: day
+  TrendMA: day
+  MomentumRSI: day
+  PullbackEMA: day
+  RangeBounce: day
+  OI_Funding: swing
+  SwingMACross: swing
+  SwingRSI: swing
+  FibPullback: swing
+  BBSqueeze: swing
